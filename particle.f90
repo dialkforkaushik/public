@@ -112,7 +112,7 @@ contains
 !!$    real :: pdt, keeV, pphi, tstart, tend
 !!$    integer :: ierr, ip, istep=0, itr, trunit=120
     real :: pdt, tstart, tend
-    integer :: ierr, istep=0, trunit=120
+    integer :: ierr, istep=0
 
     if (myrank.eq.0) then
        print *,'xlim2 = ',xlim2
@@ -155,6 +155,14 @@ contains
        call second(tend)
        write(0,'(A,I7,A,f9.2,A)')'Particle advance completed',istep-1,' steps in',&
             tend-tstart,' seconds.'
+       do istep=1,size(pdata)
+          if (pdata(istep)%np.gt.0) then
+             write(0,'(A,I7)')'1st remaining on rank 0 is',pdata(istep)%ion(1)%gid
+             write(0,'(A,I7)')'el',istep
+             write(0,'(A,3f13.6)')' x =',pdata(istep)%ion(1)%x 
+             exit
+          endif
+       enddo
     endif
 
     !Test particle pressure tensor component calculation
@@ -521,7 +529,6 @@ contains
 !---------------------------------------------------------------------------
   subroutine delete_particle(pbuf, buflen, ient, ipart, ierr)
     implicit none
-    intrinsic cshift
 
     integer, intent(in) :: buflen, ient, ipart
     type(elplist), dimension(buflen), intent(inout) :: pbuf
@@ -534,8 +541,8 @@ contains
     np = pbuf(ient)%np
     ierr = 2; if (ipart.lt.1.or.ipart.gt.np) return
 
-    !Use intrinsic circular shift function to get rid of this particle
-    pbuf(ient)%ion(ipart:np) = cshift(pbuf(ient)%ion(ipart:np), 1)
+    !Replace the particle with the last one in the array
+    pbuf(ient)%ion(ipart) = pbuf(ient)%ion(np)
     pbuf(ient)%np = np - 1
 
     ierr = 0
@@ -702,7 +709,7 @@ contains
     integer :: nrec, isghost, maxin
     integer, dimension(ndnbr) :: npin
     integer, dimension(2*ndnbr) :: nbreq
-    integer, dimension(MPI_STATUS_SIZE) :: status
+    !integer, dimension(MPI_STATUS_SIZE) :: status
 
     if (myrank.eq.0) print *,'advancing particles by ',tinc
 
@@ -1132,27 +1139,19 @@ contains
     integer, intent(out) :: tridex, ierr
 
     type(element_data) :: eldat
-    real :: xi, zi, eta, dxi, deta
+    real :: xi, zi, eta, dxi, deta, co2, sn2
     real :: d2xi, d2eta, dxieta
     integer pp
-#ifdef USE3D
-    real    :: gtmp, drtmp, dztmp, zpow
-    integer :: ii, jj
-#else
     real, dimension(2) :: mmsa
+    real, dimension(0:5) :: xipow, etapow
     integer ktri
-#endif
 
     ierr = 0;  tridex = -1
 
-#ifdef USE3D
-    call whattri(x(1),x(2),x(3),ielm,xi,zi)
-#else
     mmsa = x(1:3:2)
     if (ielm.lt.1) ielm = 1
     call m3dc1_mesh_search(ielm-1, mmsa, ktri)
     ielm = ktri + 1
-#endif
     if (ielm.le.0) then !The triangle is not in the local partition
        ierr = 1
        return
@@ -1163,9 +1162,16 @@ contains
     call get_element_data(ielm, eldat)
     call global_to_local(eldat, x(1), x(2), x(3), xi, zi, eta)
 
+    !Precompute powers
+    xipow(0) = 1.0;  etapow(0) = 1.0
+    do pp=1,5
+       xipow(pp) = xi*xipow(pp-1)
+       etapow(pp) = eta*etapow(pp-1)
+    enddo
+
     !Compute terms for function
     do pp=1,coeffs_per_tri
-       gh%g(pp) = xi**mi(pp) * eta**ni(pp)
+       gh%g(pp) = xipow(mi(pp)) * etapow(ni(pp))
     enddo !pp
 
     !Compute terms for 1st derivatives
@@ -1179,7 +1185,7 @@ contains
     else !xi.eq.0.
        do pp=1,coeffs_per_tri
           if (mi(pp).eq.1) then
-             dxi = eta**ni(pp)
+             dxi = etapow(ni(pp))
              gh%dr(pp) = gh%dr(pp) + eldat%co*dxi
              gh%dz(pp) = gh%dz(pp) + eldat%sn*dxi
           endif
@@ -1195,7 +1201,7 @@ contains
     else !eta.eq.0.
        do pp=1,coeffs_per_tri
           if (ni(pp).eq.1) then
-             deta = xi**mi(pp)
+             deta = xipow(mi(pp))
              gh%dr(pp) = gh%dr(pp) - eldat%sn*deta
              gh%dz(pp) = gh%dz(pp) + eldat%co*deta
           endif
@@ -1204,56 +1210,80 @@ contains
 
     if (ic2) then !2nd derivative terms
        gh%drr = 0.;  gh%drz = 0.;  gh%dzz = 0.
-       do pp=1,coeffs_per_tri
-          if (mi(pp).gt.0) then
-             if (mi(pp).gt.1) then
-                d2xi = mi(pp)*(mi(pp)-1)*xi**(mi(pp)-2) * eta**ni(pp)
+       co2 = eldat%co**2;  sn2 = eldat%sn**2
+       if (xi.ne.0.) then
+          do pp=1,coeffs_per_tri
+             d2xi = mi(pp)*(mi(pp)-1)*gh%g(pp)/(xi*xi)
+             gh%drr(pp) = gh%drr(pp) + d2xi*co2
+             gh%drz(pp) = gh%drz(pp) + d2xi*eldat%co*eldat%sn
+             gh%dzz(pp) = gh%dzz(pp) + d2xi*sn2
+          enddo !pp
 
-                gh%drr(pp) = gh%drr(pp) + d2xi*eldat%co**2
+          if (eta.ne.0.) then
+             do pp=1,coeffs_per_tri
+                deta = ni(pp)*gh%g(pp)/eta
+                dxieta = mi(pp)*deta/xi
+                d2eta = (ni(pp)-1)*deta/eta
+                gh%drr(pp) = gh%drr(pp) - (2.0*dxieta*eldat%co &
+                     - d2eta*eldat%sn)*eldat%sn
+                gh%drz(pp) = gh%drz(pp) + dxieta*(2.0*co2 - 1.0) &
+                     - d2eta*eldat%co*eldat%sn
+                gh%dzz(pp) = gh%dzz(pp) + (2.0*dxieta*eldat%sn &
+                     + d2eta*eldat%co)*eldat%co
+             enddo !pp
+          else !eta.eq.0., xi.ne.0.
+             do pp=1,coeffs_per_tri
+                if (ni(pp).eq.1) then
+                   dxieta = mi(pp)*xi**(mi(pp)-1)
+                   gh%drr(pp) = gh%drr(pp) - 2.0*dxieta*eldat%co*eldat%sn
+                   gh%drz(pp) = gh%drz(pp) + dxieta*(2.0*co2 - 1.0)
+                   gh%dzz(pp) = gh%dzz(pp) + 2.0*dxieta*eldat%co*eldat%sn
+                else if (ni(pp).eq.2) then
+                   d2eta = 2.0*xipow(mi(pp))
+                   gh%drr(pp) = gh%drr(pp) + d2eta*sn2
+                   gh%drz(pp) = gh%drz(pp) - d2eta*eldat%co*eldat%sn
+                   gh%dzz(pp) = gh%dzz(pp) + d2eta*co2
+                endif !ni...
+             enddo !pp
+          endif !eta...
+       else !xi.eq.0.
+          do pp=1,coeffs_per_tri
+             if (mi(pp).eq.2) then
+                d2xi = 2.0*etapow(ni(pp))
+                gh%drr(pp) = gh%drr(pp) + d2xi*co2
                 gh%drz(pp) = gh%drz(pp) + d2xi*eldat%co*eldat%sn
-                gh%dzz(pp) = gh%dzz(pp) + d2xi*eldat%sn**2
-             endif !mi > 1
-
-             if (ni(pp).gt.0) then
-                dxieta = mi(pp)*ni(pp) * xi**(mi(pp)-1) * eta**(ni(pp)-1)
-
-                gh%drr(pp) = gh%drr(pp) - 2.0*dxieta*eldat%co*eldat%sn
-                gh%drz(pp) = gh%drz(pp) + dxieta*(2.0*eldat%co**2 - 1.0)
-                gh%dzz(pp) = gh%dzz(pp) + 2.0*dxieta*eldat%co*eldat%sn
-             endif !ni > 0
-          endif !mi > 0
-
-          if (ni(pp).gt.1) then
-             d2eta = xi**mi(pp) * ni(pp)*(ni(pp)-1)*eta**(ni(pp)-2)
-
-             gh%drr(pp) = gh%drr(pp) + d2eta*eldat%sn**2
-             gh%drz(pp) = gh%drz(pp) - d2eta*eldat%co*eldat%sn
-             gh%dzz(pp) = gh%dzz(pp) + d2eta*eldat%co**2
-          endif !ni > 1
-#ifdef USE3D
-          gtmp = gh%drr(pp);  drtmp = gh%drz(pp);  dztmp = gh%dzz(pp)
-          do ii=1,coeffs_per_dphi
-             jj = pp  + (ii - 1)*coeffs_per_tri
-             zpow = zi**li(ii)
-
-             gh%drr(jj) = gtmp  * zpow
-             gh%drz(jj) = drtmp * zpow
-             gh%dzz(jj) = dztmp * zpow
-
-             !First toroidal derivative
-             if (li(ii).gt.0) then
-                zpow = li(ii) * zi**(li(ii) - 1)
-                gh%drrphi(jj) = gh%drr(pp) * zpow
-                gh%drzphi(jj) = gh%drz(pp) * zpow
-                gh%dzzphi(jj) = gh%dzz(pp) * zpow
-             else
-                gh%drrphi(jj) = 0.
-                gh%drzphi(jj) = 0.
-                gh%dzzphi(jj) = 0.
+                gh%dzz(pp) = gh%dzz(pp) + d2xi*sn2
              endif
-          enddo !ii
-#endif
-       enddo !pp
+          enddo !pp
+
+          if (eta.ne.0.) then
+             do pp=1,coeffs_per_tri
+                if (mi(pp).eq.1) then
+                   dxieta = ni(pp)*eta**(ni(pp)-1)
+                   gh%drr(pp) = gh%drr(pp) - 2.0*dxieta*eldat%co*eldat%sn
+                   gh%drz(pp) = gh%drz(pp) + dxieta*(2.0*co2 - 1.0)
+                   gh%dzz(pp) = gh%dzz(pp) + 2.0*dxieta*eldat%co*eldat%sn
+                elseif (mi(pp).eq.0) then
+                   d2eta = ni(pp)*(ni(pp)-1)*eta**(ni(pp)-2)
+                   gh%drr(pp) = gh%drr(pp) + d2eta*sn2
+                   gh%drz(pp) = gh%drz(pp) - d2eta*eldat%co*eldat%sn
+                   gh%dzz(pp) = gh%dzz(pp) + d2eta*co2
+                endif
+             enddo !pp
+          else !eta.eq.0., xi.eq.0.: just one term each
+             do pp=1,coeffs_per_tri
+                if (mi(pp).eq.1.and.ni(pp).eq.1) then !dxieta = 1.0
+                   gh%drr(pp) = gh%drr(pp) - 2.0*eldat%co*eldat%sn
+                   gh%drz(pp) = gh%drz(pp) + 2.0*co2 - 1.0
+                   gh%dzz(pp) = gh%dzz(pp) + 2.0*eldat%co*eldat%sn
+                elseif (mi(pp).eq.0.and.ni(pp).eq.2) then !d2eta = 2.0
+                   gh%drr(pp) = gh%drr(pp) + 2.0*sn2
+                   gh%drz(pp) = gh%drz(pp) - 2.0*eldat%co*eldat%sn
+                   gh%dzz(pp) = gh%dzz(pp) + 2.0*co2
+                endif !mi.and.ni...
+             enddo !pp
+          endif !eta...
+       endif !xi...
     endif !ic2
   end subroutine get_geom_terms
 
